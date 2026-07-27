@@ -103,6 +103,38 @@ aplay -l                  # Should list playback devices
 arecord -l                # Should list capture devices
 ```
 
+## Fix 4: Lid Close Suspend
+
+**Symptom:** Closing the lid does not trigger suspend. `journalctl -b -k | grep PM:` shows:
+
+```
+bitland_mifs_wmi: PM: dpm_run_callback(): bitland_mifs_wmi_suspend returns -22
+PM: Some devices failed to suspend, or early wake event detected
+```
+
+**Root Cause:** The `bitland_mifs_wmi` driver (Xiaomi WMI platform driver for fan/keyboard backlight/performance mode) has a broken suspend callback that returns `-EINVAL`, causing the entire suspend to fail.
+
+**Solution:** Create a systemd-sleep hook to unbind the device before suspend and rebind after resume.
+
+```bash
+sudo tee /usr/lib/systemd/system-sleep/bitland-workaround.sh << 'SCRIPT'
+#!/bin/bash
+DEV="B60BFB48-3E5B-49E4-A0E9-8CFFE1B3434B-4"
+
+case $1 in
+  pre)
+    echo -n "$DEV" > /sys/bus/wmi/drivers/bitland-mifs-wmi/unbind 2>/dev/null
+    ;;
+  post)
+    echo -n "$DEV" > /sys/bus/wmi/drivers/bitland-mifs-wmi/bind 2>/dev/null
+    ;;
+esac
+SCRIPT
+sudo chmod +x /usr/lib/systemd/system-sleep/bitland-workaround.sh
+```
+
+**Note:** Only `s2idle` (default) works. `deep` (S3) causes the system to hang on resume due to BIOS bugs. Do NOT set `mem_sleep_default=deep`.
+
 ## System Summary
 
 **Tested on:** Fedora 44, kernel 7.1.4-204.fc44.x86_64
@@ -115,4 +147,4 @@ arecord -l                # Should list capture devices
 - Speakers & Microphone
 - Fingerprint Sensor
 - Camera
-- Suspend/Resume
+- Suspend/Resume (s2idle only, with workaround)

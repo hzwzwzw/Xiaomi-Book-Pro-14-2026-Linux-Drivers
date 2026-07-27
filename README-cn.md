@@ -103,6 +103,38 @@ aplay -l                  # 应列出播放设备
 arecord -l                # 应列出录音设备
 ```
 
+## 修复 4：合盖休眠
+
+**症状：** 合盖后无法触发休眠。`journalctl -b -k | grep PM:` 显示：
+
+```
+bitland_mifs_wmi: PM: dpm_run_callback(): bitland_mifs_wmi_suspend returns -22
+PM: Some devices failed to suspend, or early wake event detected
+```
+
+**根因：** `bitland_mifs_wmi` 驱动（小米 WMI 平台驱动，负责风扇/键盘背光/性能模式等）的挂起回调有 bug，返回 `-EINVAL`，导致整个休眠流程失败。
+
+**解决：** 创建 systemd-sleep hook，休眠前解绑该设备，唤醒后重新绑定。
+
+```bash
+sudo tee /usr/lib/systemd/system-sleep/bitland-workaround.sh << 'SCRIPT'
+#!/bin/bash
+DEV="B60BFB48-3E5B-49E4-A0E9-8CFFE1B3434B-4"
+
+case $1 in
+  pre)
+    echo -n "$DEV" > /sys/bus/wmi/drivers/bitland-mifs-wmi/unbind 2>/dev/null
+    ;;
+  post)
+    echo -n "$DEV" > /sys/bus/wmi/drivers/bitland-mifs-wmi/bind 2>/dev/null
+    ;;
+esac
+SCRIPT
+sudo chmod +x /usr/lib/systemd/system-sleep/bitland-workaround.sh
+```
+
+**注意：** 仅 `s2idle`（默认）可用。`deep`（S3 深度休眠）因 BIOS bug 会睡死无法唤醒，切勿设置 `mem_sleep_default=deep`。
+
 ## 系统总结
 
 **测试环境：** Fedora 44, kernel 7.1.4-204.fc44.x86_64
@@ -115,4 +147,4 @@ arecord -l                # 应列出录音设备
 - 扬声器 & 麦克风
 - 指纹传感器
 - 摄像头
-- 睡眠/唤醒
+- 睡眠/唤醒（仅 s2idle，需 workaround）
