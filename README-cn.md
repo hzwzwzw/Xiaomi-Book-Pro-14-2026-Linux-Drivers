@@ -9,7 +9,7 @@
 | 组件 | 设备 ID | 状态 |
 |------|-----------|------|
 | 核显 | Intel Panther Lake Xe | ✅ 正常（需内核参数） |
-| 声卡 | Intel Panther Lake `8086:e428` | ✅ 正常（内核 ≥ 7.1） |
+| 声卡 | Intel Panther Lake `8086:e428` | ✅ 扬声器/麦克风；耳机需 RT721 修复（见下文） |
 | 指纹 | Goodix `27c6:6890` | ✅ 正常 |
 | 键盘 | - | ✅ 正常（需内核参数） |
 | 摄像头 | Shinetech `3277:00ff` | ✅ 正常 |
@@ -77,31 +77,76 @@ sudo authselect enable-feature with-fingerprint
 sudo authselect apply-changes
 ```
 
-## 修复 3：扬声器 & 麦克风（Intel Panther Lake 声卡）
+## 修复 3：内置音频与 3.5mm 耳机（Intel Panther Lake / RT721）
+
+### 3.1 内置声卡完全不可用
 
 **症状：** `aplay -l` 显示无声卡（或仅有 USB 音频设备），自带扬声器和麦克风不可用。
 
-**根因：** Intel Panther Lake (`8086:e428`) 音频需要功能拓扑 (function topology) 支持的 SOF 驱动（Linux ≥ 7.1）。
-
-**解决：**
+Intel Panther Lake (`8086:e428`) 需要带功能拓扑 (function topology) 支持的 SOF 驱动。原方案在 Fedora 44、内核 `7.1.4-204.fc44` 上验证了扬声器和麦克风；这不代表所有后续内核的耳机功能都正常。
 
 ```bash
-# 升级内核到 ≥ 7.1.4
-sudo dnf install kernel-7.1.4-204.fc44
-
-# 确保 SOF 固件已安装
-sudo dnf install alsa-sof-firmware
-
-# 重启
-sudo reboot
+sudo dnf install kernel alsa-sof-firmware
+# 保存工作后重启，再检查声卡
+cat /proc/asound/cards
+aplay -l
+arecord -l
 ```
 
-重启后验证：
+### 3.2 能识别 3.5mm 耳机，但没有声音（2026-10-28 更新）
+
+**本机现象：** Windows 中耳机正常，USB-C 转接也可用；Linux 下曾检测不到插入，后来能识别耳机但仍无声。Fedora 44、`7.2.11-200.fc44.x86_64` 下，默认输出、音量和静音设置正常；停止 PipeWire 后直接用 ALSA 播放也无声。重启及加载旧内核没有解决，因此尚不能确认是某次内核升级引入的回归。
+
+**验证有效的方案：** 将 RT721 codec 驱动换为上游提交 [`e2eb4873b901`](https://github.com/torvalds/linux/commit/e2eb4873b901290adc56b76f1d599005e620a6de) 对应版本（`ASoC: rt721-sdca: Adjust blindwrite flow to fix type detection issue`），并用 DKMS 管理。临时加载后，已确认系统声音测试和日常音频可以通过耳机播放；内置麦克风通道仍存在。证据指向驱动初始化或类型检测流程，但尚未定位到具体单项寄存器变化。
+
+本仓库提供了相同的[驱动源码与 DKMS 配置](audio/rt721-dkms/)，不是替换整个内核。以下是**首次安装**步骤，在本仓库根目录执行：
+
 ```bash
-cat /proc/asound/cards   # 应显示 Intel 声卡
-aplay -l                  # 应列出播放设备
-arecord -l                # 应列出录音设备
+kver="$(uname -r)"
+# 精确匹配当前内核，避免 DKMS 依赖顺带安装另一版内核
+sudo dnf install gcc make dkms "kernel-devel-${kver}" "kernel-devel-matched-${kver}"
+
+sudo install -d -m 0755 /usr/src/xiaomi-rt721-fix-0.1
+sudo install -m 0644 audio/rt721-dkms/rt721-sdca.c \
+  audio/rt721-dkms/rt721-sdca.h \
+  audio/rt721-dkms/rt721-sdca-sdw.c \
+  audio/rt721-dkms/rt721-sdca-sdw.h \
+  audio/rt721-dkms/rt-sdw-common.h \
+  audio/rt721-dkms/Makefile audio/rt721-dkms/dkms.conf \
+  /usr/src/xiaomi-rt721-fix-0.1/
+sudo dkms add -m xiaomi-rt721-fix -v 0.1
+sudo dkms build -m xiaomi-rt721-fix -v 0.1 -k "$kver"
+sudo dkms install -m xiaomi-rt721-fix -v 0.1 -k "$kver"
 ```
+
+如果当前内核的开发包已从软件源移除，先按[开发包归档获取方法](audio/rt721-dkms/README.md#matching-fedora-development-packages)从 Fedora 官方 Koji 下载匹配的两个 RPM，再安装。不要混用其他版本的开发包。已经安装 `xiaomi-rt721-fix/0.1` 的机器无需重复 `dkms add`。
+
+保存工作后重启，在系统声音设置中选择耳机并测试，再播放日常音频。检查：
+
+```bash
+uname -r
+dkms status
+modinfo -F filename snd_soc_rt721_sdca
+```
+
+当前适用内核应显示 `xiaomi-rt721-fix/0.1 ... installed`，模块路径应包含 `extra/`（本机 Fedora）或 `updates/dkms/`。系统原驱动保留，可回退。
+
+**适用范围与验证限制：**
+
+- 已实际验证：Fedora 44、内核 `7.2.11-200.fc44.x86_64`、RT721 + RT1320、3.5mm 耳机系统测试及日常播放。
+- DKMS 配置对 `7.2.x` / `7.3.x` 启用自动构建；只有 `7.2.11` 已在本机验证。后续更新需要对应的 `kernel-devel`，可用 `dkms status` 检查是否成功构建。
+- `7.1.x` 及 `7.4+` 不启用本地覆盖，使用系统自带驱动；不代表 `7.4+` 已在本机验证正常。
+- 本机 Secure Boot 关闭；启用 Secure Boot 的系统需要让内核信任 DKMS 模块签名后才能加载。
+- 重启后的持久加载、拔插、扬声器切换及休眠恢复尚待后续验证。
+
+**回退：**
+
+```bash
+sudo dkms remove -m xiaomi-rt721-fix -v 0.1 --all
+# 完成后保存工作并重启，使用系统原驱动
+```
+
+源码来源、构建配置及归档包获取方法见 [audio/rt721-dkms/README.md](audio/rt721-dkms/README.md)。
 
 ## 修复 4：合盖休眠
 
@@ -137,7 +182,9 @@ sudo chmod +x /usr/lib/systemd/system-sleep/bitland-workaround.sh
 
 ## 系统总结
 
-**测试环境：** Fedora 44, kernel 7.1.4-204.fc44.x86_64
+**原测试环境：** Fedora 44, kernel 7.1.4-204.fc44.x86_64
+
+**音频补充验证（2026-10-28）：** Fedora 44, kernel 7.2.11-200.fc44.x86_64；应用上述 RT721 DKMS 修复后，3.5mm 耳机系统测试和日常播放正常。
 
 **已确认正常：**
 - 屏幕显示（需 `xe.enable_psr=0`）

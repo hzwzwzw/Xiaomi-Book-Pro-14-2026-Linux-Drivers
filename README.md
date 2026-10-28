@@ -9,7 +9,7 @@ This repository documents the fixes for running Linux (Fedora 44) on the **Xiaom
 | Component | Device ID | Status |
 |-----------|-----------|--------|
 | GPU | Intel Panther Lake Xe (iGPU) | ✅ Working (with kernel param) |
-| Audio | Intel Panther Lake `8086:e428` (SOF) | ✅ Working (kernel ≥ 7.1) |
+| Audio | Intel Panther Lake `8086:e428` (SOF) | ✅ Speakers/mic; headphones need RT721 workaround below |
 | Fingerprint | Goodix `27c6:6890` | ✅ Working |
 | Keyboard | - | ✅ Working (with kernel param) |
 | Camera | Shinetech `3277:00ff` | ✅ Working |
@@ -77,31 +77,76 @@ sudo authselect enable-feature with-fingerprint
 sudo authselect apply-changes
 ```
 
-## Fix 3: Speakers & Microphone (Intel Panther Lake Audio)
+## Fix 3: Built-in Audio and 3.5mm Headphones (Intel Panther Lake / RT721)
 
-**Symptom:** `aplay -l` shows no sound cards (or only USB audio). Built-in speakers and microphone not working.
+### 3.1 No built-in sound card
 
-**Root Cause:** Intel Panther Lake (`8086:e428`) audio requires Sound Open Firmware (SOF) with function topology support, which was introduced in Linux 7.1.
+**Symptom:** `aplay -l` shows no sound cards, or only USB audio; the internal speakers and microphone do not work.
 
-**Solution:**
+Intel Panther Lake (`8086:e428`) requires SOF with function topology support. The original speaker/microphone fix was tested on Fedora 44 with `7.1.4-204.fc44`; this does not establish headphone compatibility on every later kernel.
 
 ```bash
-# Upgrade to kernel ≥ 7.1.4
-sudo dnf install kernel-7.1.4-204.fc44
-
-# Ensure SOF firmware is installed
-sudo dnf install alsa-sof-firmware
-
-# Reboot
-sudo reboot
+sudo dnf install kernel alsa-sof-firmware
+# Save your work and reboot, then check the sound card
+cat /proc/asound/cards
+aplay -l
+arecord -l
 ```
 
-After reboot, verify:
+### 3.2 3.5mm headphones detected but silent (updated 2026-10-28)
+
+**Observed on this laptop:** The same headphones work in Windows and through a USB-C adapter. Linux initially missed jack insertion, then detected the headphones but produced no sound. On Fedora 44 / `7.2.11-200.fc44.x86_64`, output selection, volume and mute were correct; direct ALSA playback with PipeWire stopped was also silent. Reboots and an older kernel did not resolve it, so a particular kernel update has not been established as the cause.
+
+**Working workaround:** Use the RT721 codec driver at upstream commit [`e2eb4873b901`](https://github.com/torvalds/linux/commit/e2eb4873b901290adc56b76f1d599005e620a6de), `ASoC: rt721-sdca: Adjust blindwrite flow to fix type detection issue`, managed by DKMS. After temporarily loading this driver, both the system sound test and ordinary audio played through the headphones; the internal microphone device remained available. The evidence points toward driver initialization or type detection, but does not isolate a particular register change.
+
+The tested [driver sources and DKMS configuration](audio/rt721-dkms/) are included. This replaces the codec module, not the entire kernel. For a **fresh installation**, run from this repository's root:
+
 ```bash
-cat /proc/asound/cards   # Should show Intel sound card
-aplay -l                  # Should list playback devices
-arecord -l                # Should list capture devices
+kver="$(uname -r)"
+# Match the running kernel instead of pulling in another kernel through DKMS dependencies
+sudo dnf install gcc make dkms "kernel-devel-${kver}" "kernel-devel-matched-${kver}"
+
+sudo install -d -m 0755 /usr/src/xiaomi-rt721-fix-0.1
+sudo install -m 0644 audio/rt721-dkms/rt721-sdca.c \
+  audio/rt721-dkms/rt721-sdca.h \
+  audio/rt721-dkms/rt721-sdca-sdw.c \
+  audio/rt721-dkms/rt721-sdca-sdw.h \
+  audio/rt721-dkms/rt-sdw-common.h \
+  audio/rt721-dkms/Makefile audio/rt721-dkms/dkms.conf \
+  /usr/src/xiaomi-rt721-fix-0.1/
+sudo dkms add -m xiaomi-rt721-fix -v 0.1
+sudo dkms build -m xiaomi-rt721-fix -v 0.1 -k "$kver"
+sudo dkms install -m xiaomi-rt721-fix -v 0.1 -k "$kver"
 ```
+
+If matching development packages have left the repositories, follow the [Fedora build archive instructions](audio/rt721-dkms/README.md#matching-fedora-development-packages) to install the matching two RPMs from official Koji storage first. Do not use development files for a different kernel. If `xiaomi-rt721-fix/0.1` is already installed, do not repeat `dkms add`.
+
+Save your work and reboot, select headphones in system sound settings, and test both system and ordinary audio. Check:
+
+```bash
+uname -r
+dkms status
+modinfo -F filename snd_soc_rt721_sdca
+```
+
+On a supported kernel, DKMS should report `xiaomi-rt721-fix/0.1 ... installed`. The module path should contain `extra/` (observed on this Fedora system) or `updates/dkms/`. The distribution driver is retained for rollback.
+
+**Scope and validation:**
+
+- Actually tested: Fedora 44, `7.2.11-200.fc44.x86_64`, RT721 + RT1320, headphone system tests and ordinary playback.
+- DKMS automatically builds for `7.2.x` / `7.3.x`; only `7.2.11` has been verified on this laptop. Kernel updates need matching `kernel-devel`; check `dkms status` afterward.
+- No local override is built for `7.1.x` or `7.4+`; those use the distribution driver. This does not claim that `7.4+` works on this laptop.
+- Secure Boot was disabled during testing. Systems with Secure Boot enabled must trust the DKMS module's signing key before loading it.
+- Persistence across reboot, jack reinsertion, speaker switching and suspend/resume still need verification.
+
+**Rollback:**
+
+```bash
+sudo dkms remove -m xiaomi-rt721-fix -v 0.1 --all
+# Once complete, save your work and reboot to use the distribution driver
+```
+
+See [audio/rt721-dkms/README.md](audio/rt721-dkms/README.md) for source provenance, build configuration and archived development packages.
 
 ## Fix 4: Lid Close Suspend
 
@@ -137,7 +182,9 @@ sudo chmod +x /usr/lib/systemd/system-sleep/bitland-workaround.sh
 
 ## System Summary
 
-**Tested on:** Fedora 44, kernel 7.1.4-204.fc44.x86_64
+**Original test environment:** Fedora 44, kernel 7.1.4-204.fc44.x86_64
+
+**Additional audio verification (2026-10-28):** Fedora 44, kernel 7.2.11-200.fc44.x86_64; headphone system tests and ordinary playback work after applying the RT721 DKMS workaround above.
 
 **Working:**
 - Display (with `xe.enable_psr=0`)
